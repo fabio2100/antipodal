@@ -1,5 +1,9 @@
+import base64
 import json
+import math
 import pathlib
+import struct
+import zlib
 from itertools import product
 
 import folium
@@ -17,13 +21,47 @@ LAND_GEOJSON_URL = (
 )
 LAND_GEOJSON_CACHE = pathlib.Path("ne_110m_land.geojson")
 
-STEP = 1  # grados entre puntos de la grilla
+# Límite estándar de Web Mercator (~85.05°): lat > esto va a infinito
+_MAX_LAT_MERC = 85.051129
 
 # Colores: (es_tierra_punto, es_tierra_antipoda)
-COLOR_AGUA_AGUA    = "#ADD8E6"  # blanco
-COLOR_AGUA_TIERRA  = "#F7BE02"  # celeste claro
-COLOR_TIERRA_AGUA  = "#006E00"  # marrón
+COLOR_AGUA_AGUA     = "#ADD8E6"  # celeste claro
+COLOR_AGUA_TIERRA   = "#F7BE02"  # amarillo
+COLOR_TIERRA_AGUA   = "#006E00"  # verde
 COLOR_TIERRA_TIERRA = "#000000"  # negro
+
+# Equivalentes RGB para pintar la imagen PNG
+_COLOR_RGB = {
+    COLOR_AGUA_AGUA:     (173, 216, 230),
+    COLOR_AGUA_TIERRA:   (247, 190,   2),
+    COLOR_TIERRA_AGUA:   (  0, 110,   0),
+    COLOR_TIERRA_TIERRA: (  0,   0,   0),
+}
+
+
+def _construir_png_b64(filas_rgb: list) -> str:
+    """Convierte filas de píxeles RGB a un PNG incrustable como data-URL base64."""
+    alto = len(filas_rgb)
+    ancho = len(filas_rgb[0]) if alto else 0
+
+    def _chunk(tag: bytes, datos: bytes) -> bytes:
+        cuerpo = tag + datos
+        return struct.pack(">I", len(datos)) + cuerpo + struct.pack(">I", zlib.crc32(cuerpo) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", ancho, alto, 8, 2, 0, 0, 0)
+    raw = bytearray()
+    for fila in filas_rgb:
+        raw.append(0)  # byte de filtro PNG (ninguno)
+        for r, g, b in fila:
+            raw += bytes([r, g, b])
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", zlib.compress(bytes(raw), level=6))
+        + _chunk(b"IEND", b"")
+    )
+    return "data:image/png;base64," + base64.b64encode(png).decode()
 
 
 class AntipodalClickHandler(MacroElement):
@@ -105,87 +143,74 @@ def antipodo(lat: float, lon: float) -> tuple:
     return anti_lat, anti_lon
 
 
-def generar_geojson_grilla(tierra_prep) -> dict:
-    half = STEP / 2
-    lats = list(range(-90, 91, STEP))
-    lons = list(range(-180, 181, STEP))
+def generar_imagen_grilla(tierra_prep) -> str:
+    """Genera imagen PNG en proyección Mercator (720×720 px, 0.5°/px en longitud)."""
+    W, H = 720, 720  # cuadrada en espacio Mercator → proporciones correctas en el mapa
 
-    print(f"Calculando {len(lats) * len(lons)} puntos de la grilla...")
+    # 1. Precalcular is_land en grilla 0.5° (índices enteros para evitar floats como clave)
+    lons_h = list(range(-360, 360))     # 720 celdas de longitud
+    lats_h = list(range(179, -181, -1)) # 360 celdas de latitud (norte→sur)
+
+    total_celdas = len(lats_h) * len(lons_h)
+    print(f"Calculando {total_celdas} celdas de tierra/agua (0.5°)...")
     is_land = {}
-    for lat, lon in product(lats, lons):
-        is_land[(lat, lon)] = tierra_prep.contains(Point(lon, lat))
-
-    print("Asignando colores según antípodas...")
-    features = []
-    for lat, lon in product(lats, lons):
-        a_lat, a_lon = antipodo(lat, lon)
-        # Los antípodas de puntos en la grilla de 5° siempre caen en la grilla
-        a_lat_r = round(a_lat / STEP) * STEP
-        a_lon_r = round(a_lon / STEP) * STEP
-        # Normalizar longitud al rango [-180, 180]
-        if a_lon_r > 180:
-            a_lon_r -= 360
-        elif a_lon_r < -180:
-            a_lon_r += 360
-
-        tierra = is_land[(lat, lon)]
-        anti_tierra = is_land.get(
-            (a_lat_r, a_lon_r),
-            tierra_prep.contains(Point(a_lon_r, a_lat_r)),
+    for lat_h, lon_h in product(lats_h, lons_h):
+        is_land[(lat_h, lon_h)] = tierra_prep.contains(
+            Point(lon_h * 0.5 + 0.25, lat_h * 0.5 + 0.25)
         )
 
-        if not tierra and not anti_tierra:
-            color = COLOR_AGUA_AGUA
-        elif not tierra and anti_tierra:
-            color = COLOR_AGUA_TIERRA
-        elif tierra and not anti_tierra:
-            color = COLOR_TIERRA_AGUA
-        else:
-            color = COLOR_TIERRA_TIERRA
+    # 2. Generar imagen en espacio Mercator:
+    #    cada fila = igual distancia de y-Mercator, así la imagen no se distorsiona
+    #    al superponerla con ImageOverlay en Leaflet (que también usa Mercator).
+    print(f"Generando imagen PNG Mercator {W}×{H} px...")
+    y_max = math.log(math.tan(math.pi / 4 + math.radians(_MAX_LAT_MERC) / 2))
 
-        # Rectángulo centrado en (lat, lon), clipeado a los límites del mapa
-        lat0 = max(-90.0, lat - half)
-        lat1 = min(90.0, lat + half)
-        lon0 = max(-180.0, lon - half)
-        lon1 = min(180.0, lon + half)
+    conteo = {c: 0 for c in _COLOR_RGB}
+    filas_rgb = []
+    for row in range(H):
+        # y-Mercator de y_max (norte) a -y_max (sur), lineal en píxeles
+        y_merc = y_max * (1 - 2 * row / H)
+        lat_real = math.degrees(2 * math.atan(math.exp(y_merc)) - math.pi / 2)
+        lat_h = min(179, max(-180, math.floor(lat_real * 2)))
+        a_lat_h = -lat_h - 1  # antípoda: -(lat_h*0.5+0.25) → celda a_lat_h
 
-        # GeoJSON usa [lon, lat]
-        coords = [
-            [lon0, lat0], [lon1, lat0], [lon1, lat1],
-            [lon0, lat1], [lon0, lat0],
-        ]
-        features.append({
-            "type": "Feature",
-            "geometry": {"type": "Polygon", "coordinates": [coords]},
-            "properties": {"color": color},
-        })
+        fila = []
+        for col in range(W):
+            lon_h = col - 360  # col 0 → lon_h=-360 (centro -179.75°) … col 719 → 359 (179.75°)
+            a_lon_h = lon_h - 360 if lon_h >= 0 else lon_h + 360
 
-    total = len(features)
-    conteo = {
-        COLOR_AGUA_AGUA:     0,
-        COLOR_AGUA_TIERRA:   0,
-        COLOR_TIERRA_AGUA:   0,
-        COLOR_TIERRA_TIERRA: 0,
-    }
-    for f in features:
-        conteo[f["properties"]["color"]] += 1
+            tierra      = is_land.get((lat_h, lon_h), False)
+            anti_tierra = is_land.get((a_lat_h, a_lon_h), False)
 
+            if not tierra and not anti_tierra:
+                color = COLOR_AGUA_AGUA
+            elif not tierra and anti_tierra:
+                color = COLOR_AGUA_TIERRA
+            elif tierra and not anti_tierra:
+                color = COLOR_TIERRA_AGUA
+            else:
+                color = COLOR_TIERRA_TIERRA
+
+            conteo[color] += 1
+            fila.append(_COLOR_RGB[color])
+        filas_rgb.append(fila)
+
+    total = W * H
     nombres = {
-        COLOR_AGUA_AGUA:     "Agua   / Agua   (blanco)",
-        COLOR_AGUA_TIERRA:   "Agua   / Tierra (celeste)",
-        COLOR_TIERRA_AGUA:   "Tierra / Agua   (marrón) ",
-        COLOR_TIERRA_TIERRA: "Tierra / Tierra (negro)  ",
+        COLOR_AGUA_AGUA:     "Agua   / Agua",
+        COLOR_AGUA_TIERRA:   "Agua   / Tierra",
+        COLOR_TIERRA_AGUA:   "Tierra / Agua",
+        COLOR_TIERRA_TIERRA: "Tierra / Tierra",
     }
     print(f"\n{'─'*45}")
-    print(f"  Distribución de celdas ({total} total, paso {STEP}°)")
+    print(f"  Distribución de píxeles ({total} total, Mercator {W}×{H})")
     print(f"{'─'*45}")
     for color, nombre in nombres.items():
         n = conteo[color]
-        pct = n / total * 100
-        print(f"  {nombre}: {n:>6}  ({pct:5.2f}%)")
+        print(f"  {nombre}: {n:>6}  ({n/total*100:5.2f}%)")
     print(f"{'─'*45}\n")
 
-    return {"type": "FeatureCollection", "features": features}
+    return _construir_png_b64(filas_rgb)
 
 
 def crear_mapa(
@@ -196,7 +221,7 @@ def crear_mapa(
 ) -> folium.Map:
     land_geojson = obtener_land_geojson()
     tierra_prep = construir_geometria_tierra(land_geojson)
-    grilla_geojson = generar_geojson_grilla(tierra_prep)
+    imagen_b64 = generar_imagen_grilla(tierra_prep)
 
     mapa = folium.Map(
         location=[lat_centro, lon_centro],
@@ -210,14 +235,11 @@ def crear_mapa(
     )
 
     # Capa coloreada según combinación tierra/agua en punto y antípoda
-    folium.GeoJson(
-        grilla_geojson,
-        style_function=lambda f: {
-            "fillColor": f["properties"]["color"],
-            "color": f["properties"]["color"],
-            "fillOpacity": 1.0,
-            "weight": 0,
-        },
+    folium.raster_layers.ImageOverlay(
+        image=imagen_b64,
+        bounds=[[-_MAX_LAT_MERC, -180], [_MAX_LAT_MERC, 180]],
+        opacity=1.0,
+        zindex=1,
     ).add_to(mapa)
 
     # Leyenda
@@ -229,7 +251,7 @@ def crear_mapa(
         <b>Punto &nbsp;/&nbsp; Antípoda</b><br><br>
         <span style="background:#FFFFFF;border:1px solid #999;display:inline-block;width:14px;height:14px;vertical-align:middle;"></span>&nbsp; Agua &nbsp;/&nbsp; Agua<br>
         <span style="background:#ADD8E6;border:1px solid #999;display:inline-block;width:14px;height:14px;vertical-align:middle;"></span>&nbsp; Agua &nbsp;/&nbsp; Tierra<br>
-        <span style="background:#8B4513;border:1px solid #999;display:inline-block;width:14px;height:14px;vertical-align:middle;"></span>&nbsp; Tierra &nbsp;/&nbsp; Agua<br>
+        <span style="background:#006E00;border:1px solid #999;display:inline-block;width:14px;height:14px;vertical-align:middle;"></span>&nbsp; Tierra &nbsp;/&nbsp; Agua<br>
         <span style="background:#000000;border:1px solid #999;display:inline-block;width:14px;height:14px;vertical-align:middle;"></span>&nbsp; Tierra &nbsp;/&nbsp; Tierra<br>
     </div>
     """
