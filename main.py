@@ -4,7 +4,9 @@ from itertools import product
 
 import folium
 import requests
+from branca.element import MacroElement
 from folium.plugins import MousePosition
+from jinja2 import Template
 from shapely.geometry import Point, shape
 from shapely.ops import unary_union
 from shapely.prepared import prep
@@ -22,6 +24,63 @@ COLOR_AGUA_AGUA    = "#ADD8E6"  # blanco
 COLOR_AGUA_TIERRA  = "#F7BE02"  # celeste claro
 COLOR_TIERRA_AGUA  = "#006E00"  # marrón
 COLOR_TIERRA_TIERRA = "#000000"  # negro
+
+
+class AntipodalClickHandler(MacroElement):
+    """Coloca un marcador rojo en la antípoda del punto clickeado."""
+
+    def __init__(self):
+        super().__init__()
+        self._name = "AntipodalClickHandler"
+        self._template = Template("""
+            {% macro script(this, kwargs) %}
+            (function () {
+                var theMap = {{ this._parent.get_name() }};
+                var antipodalMarker = null;
+                var clickedMarker = null;
+
+                theMap.on('click', function (e) {
+                    var lat = e.latlng.lat;
+                    var lon = e.latlng.lng;
+
+                    // Normalizar longitud al rango [-180, 180]
+                    lon = ((lon + 180) % 360 + 360) % 360 - 180;
+
+                    // Calcular antípoda
+                    var antiLat = -lat;
+                    var antiLon = lon >= 0 ? lon - 180 : lon + 180;
+
+                    // Eliminar marcadores previos
+                    if (antipodalMarker) { theMap.removeLayer(antipodalMarker); }
+                    if (clickedMarker)   { theMap.removeLayer(clickedMarker); }
+
+                    // Marcador azul en el punto clickeado
+                    clickedMarker = L.circleMarker([lat, lon], {
+                        radius: 8,
+                        color: '#0055ff',
+                        fillColor: '#0055ff',
+                        fillOpacity: 0.85,
+                        weight: 2
+                    }).bindTooltip('Punto: ' + lat.toFixed(4) + ', ' + lon.toFixed(4))
+                      .addTo(theMap);
+
+                    // Marcador rojo en la antípoda
+                    antipodalMarker = L.circleMarker([antiLat, antiLon], {
+                        radius: 8,
+                        color: '#cc0000',
+                        fillColor: '#ff0000',
+                        fillOpacity: 0.85,
+                        weight: 2
+                    }).bindTooltip('Antípoda: ' + antiLat.toFixed(4) + ', ' + antiLon.toFixed(4))
+                      .bindPopup(
+                          '<b>Antípoda</b><br>Lat: ' + antiLat.toFixed(4) +
+                          '<br>Lon: ' + antiLon.toFixed(4)
+                      ).addTo(theMap)
+                      .openPopup();
+                });
+            })();
+            {% endmacro %}
+        """)
 
 
 def obtener_land_geojson() -> dict:
@@ -185,8 +244,8 @@ def crear_mapa(
         lng_formatter="function(num) {return L.Util.formatNum(num, 6);}",
     ).add_to(mapa)
 
-    # Popup con lat/lon al hacer clic
-    folium.LatLngPopup().add_to(mapa)
+    # Marcador rojo en la antípoda al hacer clic
+    AntipodalClickHandler().add_to(mapa)
 
     mapa.save(archivo_salida)
     print(f"Mapa guardado en: {archivo_salida}")
